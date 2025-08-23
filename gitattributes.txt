@@ -1,8 +1,1 @@
-*.md text
-*.tex text
-*.lua text
-*.c text
-*.h text
-*.ps text
-*.awk text
-* text eol=lf
+* text eol=auto
