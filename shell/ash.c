@@ -384,10 +384,16 @@ union node;
 struct strlist;
 struct job;
 
+#if defined(_WIN64)
+# define ALIGN64 ALIGNED(16)
+#else
+# define ALIGN64
+#endif
+
 struct forkshell {
 	/* filled by forkshell_copy() */
-	struct globals_var *gvp;
 	struct globals_misc *gmp;
+	struct globals_var *gvp;
 	struct tblentry **cmdtable;
 #if ENABLE_ASH_ALIAS
 	struct alias **atab;
@@ -401,7 +407,6 @@ struct forkshell {
 	unsigned njobs;
 	struct job *curjob;
 #endif
-	/* struct parsefile *g_parsefile; */
 	HANDLE hMapFile;
 	char *old_base;
 	int size;
@@ -426,8 +431,8 @@ struct forkshell {
 	int fd[3];
 	union node *n;
 	char **argv;
-	char *path;
-};
+	const char *path;
+} ALIGN64;
 
 enum {
 	FS_OPENHERE,
@@ -534,6 +539,65 @@ static const char *const optletters_optnames[] ALIGN_PTR = {
 enum { NOPTS = ARRAY_SIZE(optletters_optnames) };
 
 
+/* ============ Parser data */
+
+struct strlist {
+	struct strlist *next;
+	char *text;
+};
+
+struct alias;
+
+struct strpush {
+	struct strpush *prev;   /* preceding string on stack */
+	char *prev_string;
+	int prev_left_in_line;
+#if ENABLE_ASH_ALIAS
+	struct alias *ap;       /* if push was associated with an alias */
+#endif
+	char *string;           /* remember the string since it may change */
+
+	/* Delay freeing so we can stop nested aliases. */
+	struct strpush *spfree;
+
+	/* Remember last two characters for pungetc. */
+	int lastc[2];
+
+	/* Number of outstanding calls to pungetc. */
+	int unget;
+};
+
+/*
+ * The parsefile structure pointed to by the global variable parsefile
+ * contains information about the current file being read.
+ */
+struct parsefile {
+	struct parsefile *prev; /* preceding file on stack */
+	int linno;              /* current line */
+	int pf_fd;              /* file descriptor (or -1 if string) */
+	int left_in_line;       /* number of chars left in this line */
+	int left_in_buffer;     /* number of chars left in this buffer past the line */
+	char *next_to_pgetc;    /* next char in buffer */
+	char *buf;              /* input buffer */
+	struct strpush *strpush; /* for pushing strings at this level */
+	struct strpush basestrpush; /* so pushing one is fast */
+
+	/* Delay freeing so we can stop nested aliases. */
+	struct strpush *spfree;
+
+	/* Remember last two characters for pungetc. */
+	int lastc[2];
+
+	/* Number of outstanding calls to pungetc. */
+	int unget;
+
+#if ENABLE_PLATFORM_MINGW32
+	/* True if a trailing CR from a previous read was left unprocessed. */
+	int cr;
+#endif
+};
+
+
 /* ============ Misc data */
 
 #define msg_illnum "Illegal number: %s"
@@ -558,6 +622,9 @@ struct globals_misc {
 	smallint job_warning;   /* user was warned about stopped jobs (can be 2, 1 or 0). */
 #endif
 	smallint inps4;		/* Prevent PS4 nesting. */
+#if !ENABLE_PLATFORM_MINGW32
+	smallint vforked;
+#endif
 	int savestatus;         /* exit status of last command outside traps */
 	int rootpid;            /* pid of main shell */
 	/* shell level: 0 for the main shell, 1 for its children, and so on */
@@ -581,9 +648,6 @@ struct globals_misc {
 	char *physdir; // = nullstr;    /* physical working directory */
 
 	char *arg0; /* value of $0 */
-#if ENABLE_PLATFORM_MINGW32
-	char *commandname;
-#endif
 
 	struct jmploc *exception_handler;
 
@@ -595,8 +659,10 @@ struct globals_misc {
 	 */
 	volatile /*sig_atomic_t*/ smallint pending_int; /* 1 = got SIGINT */
 #if !ENABLE_PLATFORM_MINGW32
-	volatile /*sig_atomic_t*/ smallint got_sigchld; /* 1 = got SIGCHLD */
+	volatile /*sig_atomic_t*/ smallint gotsigchld;  /* 1 = got SIGCHLD */
 	volatile /*sig_atomic_t*/ smallint pending_sig;	/* last pending signal */
+#else
+	volatile /*sig_atomic_t*/ smallint waitcmd_int;	/* SIGINT in wait */
 #endif
 	smallint exception_type; /* kind of exception: */
 #define EXINT 0         /* SIGINT received */
@@ -669,7 +735,13 @@ struct globals_misc {
 
 	char **trap_ptr;        /* used only by "trap hack" */
 
+	char *commandname;             /* currently executing command */
+	struct parsefile *g_parsefile; /* = &basepf, current input file */
+	struct parsefile basepf;       /* top level input file */
+
 	/* Rarely referenced stuff */
+
+	struct jmploc main_handler;
 
 	/* Cached supplementary group array (for testing executable'ity of files) */
 	struct cached_groupinfo groupinfo;
@@ -685,6 +757,11 @@ extern struct globals_misc *BB_GLOBAL_CONST ash_ptr_to_globals_misc;
 #define back_exitstatus   (G_misc.back_exitstatus )
 #define job_warning       (G_misc.job_warning)
 #define inps4       (G_misc.inps4      )
+#if !ENABLE_PLATFORM_MINGW32
+#define vforked     (G_misc.vforked    )
+#else
+#define vforked     0
+#endif
 #define savestatus  (G_misc.savestatus )
 #define rootpid     (G_misc.rootpid    )
 #define shlvl       (G_misc.shlvl      )
@@ -701,14 +778,14 @@ extern struct globals_misc *BB_GLOBAL_CONST ash_ptr_to_globals_misc;
 #define curdir      (G_misc.curdir     )
 #define physdir     (G_misc.physdir    )
 #define arg0        (G_misc.arg0       )
-#if ENABLE_PLATFORM_MINGW32
-#define commandname (G_misc.commandname)
-#endif
 #define exception_handler (G_misc.exception_handler)
 #define exception_type    (G_misc.exception_type   )
 #define suppress_int      (G_misc.suppress_int     )
 #define pending_int       (G_misc.pending_int      )
-#define got_sigchld       (G_misc.got_sigchld      )
+#if ENABLE_PLATFORM_MINGW32
+#define waitcmd_int       (G_misc.waitcmd_int      )
+#endif
+#define gotsigchld        (G_misc.gotsigchld       )
 #define pending_sig       (G_misc.pending_sig      )
 #define nullstr     (G_misc.nullstr    )
 #define optlist     (G_misc.optlist    )
@@ -717,6 +794,10 @@ extern struct globals_misc *BB_GLOBAL_CONST ash_ptr_to_globals_misc;
 #define may_have_traps    (G_misc.may_have_traps   )
 #define trap        (G_misc.trap       )
 #define trap_ptr    (G_misc.trap_ptr   )
+#define commandname (G_misc.commandname)
+#define g_parsefile (G_misc.g_parsefile  )
+#define basepf      (G_misc.basepf     )
+#define main_handler      (G_misc.main_handler     )
 #define groupinfo   (G_misc.groupinfo  )
 #define random_gen  (G_misc.random_gen )
 #define backgndpid  (G_misc.backgndpid )
@@ -733,6 +814,7 @@ extern struct globals_misc *BB_GLOBAL_CONST ash_ptr_to_globals_misc;
 	curdir = nullstr; \
 	physdir = nullstr; \
 	trap_ptr = trap; \
+	g_parsefile = &basepf; \
 	groupinfo.euid = -1; \
 	groupinfo.egid = -1; \
 } while (0)
@@ -780,73 +862,26 @@ var_end(const char *var)
 	return var;
 }
 
-
-/* ============ Parser data */
-
-/*
- * ash_vmsg() needs parsefile->fd, hence parsefile definition is moved up.
+#if !ENABLE_PLATFORM_MINGW32
+/* Our signal logic never blocks individual signals
+ * using signal mask - only by setting SIG_IGN handler.
+ * Therefore just unmasking all of them instead of "restore old mask"
+ * approach is safe, modulo a case where the shell itself inherited
+ * a _masked_ signal.
  */
-struct strlist {
-	struct strlist *next;
-	char *text;
-};
-
-struct alias;
-
-struct strpush {
-	struct strpush *prev;   /* preceding string on stack */
-	char *prev_string;
-	int prev_left_in_line;
-#if ENABLE_ASH_ALIAS
-	struct alias *ap;       /* if push was associated with an alias */
+static void
+sigclearmask(void)
+{
+	sigprocmask_allsigs(SIG_UNBLOCK);
+}
 #endif
-	char *string;           /* remember the string since it may change */
 
-	/* Delay freeing so we can stop nested aliases. */
-	struct strpush *spfree;
-
-	/* Remember last two characters for pungetc. */
-	int lastc[2];
-
-	/* Number of outstanding calls to pungetc. */
-	int unget;
-};
-
-/*
- * The parsefile structure pointed to by the global variable parsefile
- * contains information about the current file being read.
- */
-struct parsefile {
-	struct parsefile *prev; /* preceding file on stack */
-	int linno;              /* current line */
-	int pf_fd;              /* file descriptor (or -1 if string) */
-	int left_in_line;       /* number of chars left in this line */
-	int left_in_buffer;     /* number of chars left in this buffer past the line */
-	char *next_to_pgetc;    /* next char in buffer */
-	char *buf;              /* input buffer */
-	struct strpush *strpush; /* for pushing strings at this level */
-	struct strpush basestrpush; /* so pushing one is fast */
-
-	/* Delay freeing so we can stop nested aliases. */
-	struct strpush *spfree;
-
-	/* Remember last two characters for pungetc. */
-	int lastc[2];
-
-	/* Number of outstanding calls to pungetc. */
-	int unget;
-
-#if ENABLE_PLATFORM_MINGW32
-	/* True if a trailing CR from a previous read was left unprocessed. */
-	int cr;
-#endif
-};
-
-static struct parsefile basepf;        /* top level input file */
-static struct parsefile *g_parsefile = &basepf;  /* current input file */
-#if ENABLE_PLATFORM_POSIX
-static char *commandname;              /* currently executing command */
-#endif
+/* Reset handler when entering a subshell */
+static void
+reset_exception_handler(void)
+{
+	exception_handler = &main_handler;
+}
 
 
 /* ============ Interrupts / exceptions */
@@ -860,13 +895,13 @@ static void exitshell(void) NORETURN;
  * more fun than worrying about efficiency and portability. :-))
  */
 #if DEBUG_INTONOFF
-# define INT_OFF do { \
-	TRACE(("%s:%d INT_OFF(%d)\n", __func__, __LINE__, suppress_int)); \
+# define INTOFF do { \
+	TRACE(("%s:%d INTOFF(%d)\n", __func__, __LINE__, suppress_int)); \
 	suppress_int++; \
 	barrier(); \
 } while (0)
 #else
-# define INT_OFF do { \
+# define INTOFF do { \
 	suppress_int++; \
 	barrier(); \
 } while (0)
@@ -885,7 +920,11 @@ raise_exception(int e)
 	if (exception_handler == NULL)
 		abort();
 #endif
-	INT_OFF;
+
+	if (vforked)
+		_exit(exitstatus);
+
+	INTOFF;
 	exception_type = e;
 	longjmp(exception_handler->loc, 1);
 }
@@ -896,24 +935,25 @@ raise_exception(int e)
 } while (0)
 #endif
 
+#if ENABLE_PLATFORM_MINGW32
+static void
+write_ctrl_c(void)
+{
+	write(STDOUT_FILENO, "^C", 2);
+}
+#endif
+
 /*
  * Called when a SIGINT is received.  (If the user specifies
  * that SIGINT is to be trapped or ignored using the trap builtin, then
  * this routine is not called.)  suppress_int is nonzero when interrupts
- * are held using the INT_OFF macro.  (The test for iflag is just
+ * are held using the INTOFF macro.  (The test for iflag is just
  * defensive programming.)
  */
-static void raise_interrupt(void) IF_NOT_PLATFORM_MINGW32(NORETURN);
+static void raise_interrupt(void) NORETURN;
 static void
 raise_interrupt(void)
 {
-#if ENABLE_PLATFORM_MINGW32
-	/* Contrary to the comment above on Windows raise_interrupt() is
-	 * called when SIGINT is trapped or ignored.  We detect this here
-	 * and return without doing anything. */
-	if (trap[SIGINT])
-		return;
-#endif
 	pending_int = 0;
 #if !ENABLE_PLATFORM_MINGW32
 	/* Signal is not automatically unmasked after it is raised,
@@ -935,7 +975,7 @@ raise_interrupt(void)
 	}
 #if ENABLE_PLATFORM_MINGW32
 	if (iflag)
-		write(STDOUT_FILENO, "^C", 2);
+		write_ctrl_c();
 #endif
 	/* bash: ^C even on empty command line sets $? */
 	exitstatus = SIGINT + 128;
@@ -958,12 +998,12 @@ int_on(void)
 	barrier();
 }
 #if DEBUG_INTONOFF
-# define INT_ON do { \
-	TRACE(("%s:%d INT_ON(%d)\n", __func__, __LINE__, suppress_int-1)); \
+# define INTON do { \
+	TRACE(("%s:%d INTON(%d)\n", __func__, __LINE__, suppress_int-1)); \
 	int_on(); \
 } while (0)
 #else
-# define INT_ON int_on()
+# define INTON int_on()
 #endif
 static IF_NOT_ASH_OPTIMIZE_FOR_SIZE(inline) void
 force_int_on(void)
@@ -974,7 +1014,7 @@ force_int_on(void)
 		raise_interrupt(); /* does not return */
 	barrier();
 }
-#define FORCE_INT_ON force_int_on()
+#define FORCEINTON force_int_on()
 
 #define SAVE_INT(v) ((v) = suppress_int)
 
@@ -992,27 +1032,27 @@ force_int_on(void)
 static void
 outstr(const char *p, FILE *file)
 {
-	INT_OFF;
+	INTOFF;
 	fputs(p, file);
-	INT_ON;
+	INTON;
 }
 
 static void
 flush_stdout_stderr(void)
 {
-	INT_OFF;
+	INTOFF;
 	fflush_all();
-	INT_ON;
+	INTON;
 }
 
 /* Was called outcslow(c,FILE*), but c was always '\n' */
 static void
 newline_and_flush(FILE *dest)
 {
-	INT_OFF;
+	INTOFF;
 	putc('\n', dest);
 	fflush(dest);
-	INT_ON;
+	INTON;
 }
 
 static int out1fmt(const char *, ...) __attribute__((__format__(__printf__,1,2)));
@@ -1022,11 +1062,11 @@ out1fmt(const char *fmt, ...)
 	va_list ap;
 	int r;
 
-	INT_OFF;
+	INTOFF;
 	va_start(ap, fmt);
 	r = vprintf(fmt, ap);
 	va_end(ap);
-	INT_ON;
+	INTON;
 	return r;
 }
 
@@ -1037,11 +1077,11 @@ fmtstr(char *outbuf, size_t length, const char *fmt, ...)
 	va_list ap;
 	int ret;
 
-	INT_OFF;
+	INTOFF;
 	va_start(ap, fmt);
 	ret = vsnprintf(outbuf, length, fmt, ap);
 	va_end(ap);
-	INT_ON;
+	INTON;
 	return ret > (int)length ? length : ret;
 }
 
@@ -1147,14 +1187,15 @@ static const char dolatstr[] ALIGN1 = {
 #endif
 #define NCLOBBER 18
 #define NFROM    19
-#define NFROMTO  20
-#define NAPPEND  21
-#define NTOFD    22
-#define NFROMFD  23
-#define NHERE    24
-#define NXHERE   25
-#define NNOT     26
-#define N_NUMBER 27
+#define NFROMSTR 20
+#define NFROMTO  21
+#define NAPPEND  22
+#define NTOFD    23
+#define NFROMFD  24
+#define NHERE    25
+#define NXHERE   26
+#define NNOT     27
+#define N_NUMBER 28
 
 union node;
 
@@ -1585,6 +1626,7 @@ shcmd(union node *cmd, FILE *fp)
 #endif
 		case NTOFD:    s = ">&"; dftfd = 1; break;
 		case NFROM:    s = "<"; break;
+		case NFROMSTR: s = "<<<"; break;
 		case NFROMFD:  s = "<&"; break;
 		case NFROMTO:  s = "<>"; break;
 		default:       s = "*error*"; break;
@@ -1707,6 +1749,7 @@ ash_vmsg_and_raise(int cond, const char *msg, va_list ap)
 	/* NOTREACHED */
 }
 
+/* This function is called sh_error() in dash */
 static void ash_msg_and_raise_error(const char *, ...) NORETURN;
 static void
 ash_msg_and_raise_error(const char *msg, ...)
@@ -1761,17 +1804,60 @@ ash_msg(const char *fmt, ...)
 }
 
 /*
+ * Types of operations (passed to the errmsg routine).
+ */
+#define E_OPEN 01	/* opening a file */
+#define E_CREAT 02	/* creating a file */
+#define E_EXEC 04	/* executing a program */
+/*
  * Return a string describing an error.  The returned string may be a
  * pointer to a static buffer that will be overwritten on the next call.
  * Action describes the operation that got the error.
  */
 static const char *
-errmsg(int e, const char *em)
+errmsg(int e, int action)
 {
-	if (e == ENOENT || e == ENOTDIR) {
-		return em;
+	if (e != ENOENT && e != ENOTDIR)
+		return strerror(e);
+
+	if (action & E_OPEN)
+		return "no such file";
+	else if (action & E_CREAT)
+		return "nonexistent directory";
+	else
+		return "not found";
+}
+
+static int sh_open_fail(const char *, int, int) NORETURN;
+static int sh_open_fail(const char *pathname, int flags, int e)
+{
+	const char *word;
+	int action;
+
+	word = "open";
+	action = E_OPEN;
+	if (flags & O_CREAT) {
+		word = "create";
+		action = E_CREAT;
 	}
-	return strerror(e);
+
+	ash_msg_and_raise_error("can't %s %s: %s", word, pathname, errmsg(e, action));
+}
+
+static int sh_open(const char *pathname, int flags, int mayfail)
+{
+	int fd;
+	int e;
+
+	do {
+		fd = open(pathname, flags, 0666);
+		e = errno;
+	} while (fd < 0 && e == EINTR && !pending_sig);
+
+	if (mayfail || fd >= 0)
+		return fd;
+
+	sh_open_fail(pathname, flags, e);
 }
 
 
@@ -1896,14 +1982,14 @@ stalloc(size_t nbytes)
 		len = sizeof(struct stack_block) - MINSIZE + blocksize;
 		if (len < blocksize)
 			ash_msg_and_raise_error(bb_msg_memory_exhausted);
-		INT_OFF;
+		INTOFF;
 		sp = ckmalloc(len);
 		sp->prev = g_stackp;
 		g_stacknxt = sp->space;
 		g_stacknleft = blocksize;
 		sstrend = g_stacknxt + blocksize;
 		g_stackp = sp;
-		INT_ON;
+		INTON;
 	}
 	p = g_stacknxt;
 	g_stacknxt += aligned;
@@ -1969,7 +2055,7 @@ popstackmark(struct stackmark *mark)
 	if (!mark->stackp)
 		return;
 
-	INT_OFF;
+	INTOFF;
 	while (g_stackp != mark->stackp) {
 		sp = g_stackp;
 		g_stackp = sp->prev;
@@ -1978,7 +2064,7 @@ popstackmark(struct stackmark *mark)
 	g_stacknxt = mark->stacknxt;
 	g_stacknleft = mark->stacknleft;
 	sstrend = mark->stacknxt + mark->stacknleft;
-	INT_ON;
+	INTON;
 }
 
 /*
@@ -2007,7 +2093,7 @@ growstackblock(size_t min)
 		struct stack_block *prevstackp;
 		size_t grosslen;
 
-		INT_OFF;
+		INTOFF;
 		sp = g_stackp;
 		prevstackp = sp->prev;
 		grosslen = newlen + sizeof(struct stack_block) - MINSIZE;
@@ -2017,7 +2103,7 @@ growstackblock(size_t min)
 		g_stacknxt = sp->space;
 		g_stacknleft = newlen;
 		sstrend = sp->space + newlen;
-		INT_ON;
+		INTON;
 	} else {
 		char *oldspace = g_stacknxt;
 		size_t oldlen = g_stacknleft;
@@ -2877,7 +2963,7 @@ setvar(const char *name, const char *val, int flags)
 		vallen = strlen(val);
 	}
 
-	INT_OFF;
+	INTOFF;
 	nameeq = ckzalloc(namelen + vallen + 2);
 	p = mempcpy(nameeq, name, namelen);
 	if (val) {
@@ -2885,7 +2971,7 @@ setvar(const char *name, const char *val, int flags)
 		strcpy(p, val);
 	}
 	vp = setvareq(nameeq, flags | VNOSAVE);
-	INT_ON;
+	INTON;
 
 	return vp;
 }
@@ -3440,7 +3526,7 @@ setpwd(const char *val, int setold)
 	if (setold) {
 		setvar("OLDPWD", oldcur, VEXPORT);
 	}
-	INT_OFF;
+	INTOFF;
 	if (physdir != nullstr) {
 		if (physdir != oldcur)
 			free(physdir);
@@ -3457,7 +3543,7 @@ setpwd(const char *val, int setold)
 		free(oldcur);
 	}
 	curdir = dir;
-	INT_ON;
+	INTON;
 	setvar("PWD", dir, VEXPORT);
 }
 
@@ -3475,7 +3561,7 @@ docd(const char *dest, int flags)
 
 	TRACE(("docd(\"%s\", %d) called\n", dest, flags));
 
-	INT_OFF;
+	INTOFF;
 	if (!(flags & CD_PHYSICAL)) {
 		dir = updatepwd(dest);
 		if (dir)
@@ -3487,7 +3573,7 @@ docd(const char *dest, int flags)
 	setpwd(dir, 1);
 	hashcd();
  out:
-	INT_ON;
+	INTON;
 	return err;
 }
 
@@ -4074,7 +4160,7 @@ setalias(const char *name, const char *val)
 
 	app = __lookupalias(name);
 	ap = *app;
-	INT_OFF;
+	INTOFF;
 	if (ap) {
 		if (!(ap->flag & ALIASINUSE)) {
 			free(ap->val);
@@ -4090,7 +4176,7 @@ setalias(const char *name, const char *val)
 		/*ap->next = NULL;*/
 		*app = ap;
 	}
-	INT_ON;
+	INTON;
 }
 
 static int
@@ -4101,9 +4187,9 @@ unalias(const char *name)
 	app = __lookupalias(name);
 
 	if (*app) {
-		INT_OFF;
+		INTOFF;
 		*app = freealias(*app);
-		INT_ON;
+		INTON;
 		return 0;
 	}
 
@@ -4116,7 +4202,7 @@ rmaliases(void)
 	struct alias *ap, **app;
 	int i;
 
-	INT_OFF;
+	INTOFF;
 	for (i = 0; i < ATABSIZE; i++) {
 		app = &atab[i];
 		for (ap = *app; ap; ap = *app) {
@@ -4126,7 +4212,7 @@ rmaliases(void)
 			}
 		}
 	}
-	INT_ON;
+	INTON;
 }
 
 static void
@@ -4247,20 +4333,19 @@ struct job {
 	struct job *prev_job;   /* previous job */
 };
 
-static struct job *makejob(int);
 #if !ENABLE_PLATFORM_MINGW32
 static int forkshell(struct job *, union node *, int);
 #endif
 static int waitforjob(struct job *);
 
 #if !JOBS && !JOBS_WIN32
-enum { doing_jobctl = 0 };
+enum { jobctl = 0 };
 #define setjobctl(on) do {} while (0)
 #elif JOBS_WIN32
-static smallint doing_jobctl; //references:8
-#define setjobctl(on) do { if (rootshell) doing_jobctl = on; } while (0)
+static smallint jobctl; //references:8
+#define setjobctl(on) do { if (rootshell) jobctl = on; } while (0)
 #else /* JOBS */
-static smallint doing_jobctl; //references:8
+static smallint jobctl; //references:8
 static void setjobctl(int);
 #endif
 
@@ -4276,17 +4361,25 @@ ignoresig(int signo)
 		/* No, need to do it */
 		signal(signo, SIG_IGN);
 	}
-	sigmode[signo - 1] = S_HARD_IGN;
+	if (!vforked)
+		sigmode[signo - 1] = S_HARD_IGN;
 }
 
 /*
  * Only one usage site - in setsignal()
+ * This function is called onsig() in dash
  */
 static void
 signal_handler(int signo)
 {
+	// parent momentarily has vforked == 1 too, but it masks
+	// all signals until after it resets vforked to 0.
+	if (vforked)
+		/* We are vfork child, DO NOT MODIFY ANY VARIABLES! */
+		return;
+
 	if (signo == SIGCHLD) {
-		got_sigchld = 1;
+		gotsigchld = 1;
 		if (!trap[SIGCHLD])
 			return;
 	}
@@ -4312,9 +4405,12 @@ signal_handler(int signo)
 static void
 setsignal(int signo)
 {
+	int lvforked;
 	char *t;
 	char cur_act, new_act;
 	struct sigaction act;
+
+	lvforked = vforked;
 
 	t = trap[signo];
 	new_act = S_DFL;
@@ -4324,7 +4420,7 @@ setsignal(int signo)
 			new_act = S_IGN;
 	}
 
-	if (rootshell && new_act == S_DFL) {
+	if (rootshell && new_act == S_DFL && !lvforked) {
 		switch (signo) {
 		case SIGINT:
 			if (iflag || minusc || sflag == 0)
@@ -4394,8 +4490,8 @@ setsignal(int signo)
 	if (cur_act == S_HARD_IGN || cur_act == new_act)
 		return;
 
-	*t = new_act;
-
+	if (!lvforked)
+		*t = new_act;
 	act.sa_handler = SIG_DFL;
 	switch (new_act) {
 	case S_CATCH:
@@ -4658,7 +4754,7 @@ freejob(struct job *jp)
 	int i;
 #endif
 
-	INT_OFF;
+	INTOFF;
 #if ENABLE_PLATFORM_POSIX || JOBS_WIN32
 	for (i = jp->nprocs, ps = jp->ps; --i >= 0; ps++) {
 		if (ps->ps_cmd != nullstr)
@@ -4669,14 +4765,29 @@ freejob(struct job *jp)
 		free(jp->ps);
 	jp->used = 0;
 	set_curjob(jp, CUR_DELETE);
-	INT_ON;
+	INTON;
 }
 
 #if JOBS
 static void
 xtcsetpgrp(int fd, pid_t pgrp)
 {
-	if (tcsetpgrp(fd, pgrp))
+	int err;
+
+	sigblockall(NULL);
+	err = tcsetpgrp(fd, pgrp);
+	sigclearmask();
+	// Unmasking signals would cause any arrived signal to trigger, so why?
+	// Generally yes, but there are exceptions. Such as:
+	// """
+	// Attempts to use tcsetpgrp() from a process which is a member of
+	// a background process group on a fd associated with its controlling
+	// terminal shall cause the process group to be sent a SIGTTOU signal.
+	// If the calling thread is blocking SIGTTOU signals or the process
+	// is ignoring SIGTTOU signals, the process shall be allowed
+	// to perform the operation, and no signal is sent."""
+
+	if (err)
 		ash_msg_and_raise_perror("can't set tty process group");
 }
 
@@ -4695,11 +4806,11 @@ setjobctl(int on)
 	int fd;
 	int pgrp;
 
-	if (on == doing_jobctl || rootshell == 0)
+	if (on == jobctl || rootshell == 0)
 		return;
 	if (on) {
 		int ofd;
-		ofd = fd = open(_PATH_TTY, O_RDWR);
+		ofd = fd = sh_open(_PATH_TTY, O_RDWR, 1);
 		if (fd < 0) {
 	/* BTW, bash will try to open(ttyname(0)) if open("/dev/tty") fails.
 	 * That sometimes helps to acquire controlling tty.
@@ -4755,7 +4866,7 @@ setjobctl(int on)
 		fd = -1;
 	}
 	ttyfd = fd;
-	doing_jobctl = on;
+	jobctl = on;
 }
 #endif
 
@@ -4844,7 +4955,7 @@ restartjob(struct job *jp, int mode)
 	int status;
 	pid_t pgid;
 
-	INT_OFF;
+	INTOFF;
 	if (jp->state == JOBDONE)
 		goto out;
 	jp->state = JOBRUNNING;
@@ -4864,7 +4975,7 @@ restartjob(struct job *jp, int mode)
 	} while (--i);
  out:
 	status = (mode == FORK_FG) ? waitforjob(jp) : 0;
-	INT_ON;
+	INTON;
 	return status;
 }
 
@@ -4933,9 +5044,12 @@ static BOOL WINAPI ctrl_handler(DWORD dwCtrlType)
 # if ENABLE_FEATURE_EDITING
 		bb_got_signal = SIGINT; /* for read_line_input: "we got a signal" */
 # endif
-		if (!suppress_int && !(rootshell && iflag))
-			raise_interrupt();
-		pending_int = 1;
+		waitcmd_int = -waitcmd_int;
+		if (!trap[SIGINT]) {
+			if (!suppress_int && !(rootshell && iflag))
+				raise_interrupt();
+			pending_int = 1;
+		}
 		return TRUE;
 	}
 	return FALSE;
@@ -4946,7 +5060,7 @@ static BOOL WINAPI ctrl_handler(DWORD dwCtrlType)
  * They don't support waitpid(-1)
  */
 static pid_t
-waitpid_child(int *status, int wait_flags)
+waitpid_child(int *status, DWORD blocking)
 {
 	struct job *jb;
 	int pid_nr = 0;
@@ -4972,24 +5086,26 @@ waitpid_child(int *status, int wait_flags)
 	}
 
 	if (pid_nr) {
-		idx = WaitForMultipleObjects(pid_nr, proclist, FALSE,
-					wait_flags & WNOHANG ? 0 : INFINITE);
-		if (idx < pid_nr) {
-			GetExitCodeProcess(proclist[idx], &win_status);
-			*status = exit_code_to_wait_status(win_status);
-			pid = GetProcessId(proclist[idx]);
-		}
+		do {
+			idx = WaitForMultipleObjects(pid_nr, proclist, FALSE, blocking);
+			if (idx < pid_nr) {
+				GetExitCodeProcess(proclist[idx], &win_status);
+				*status = exit_code_to_wait_status(win_status);
+				pid = GetProcessId(proclist[idx]);
+				break;
+			}
+		} while (blocking && !pending_int && waitcmd_int != 1);
 	}
 	return pid;
 }
-#define waitpid(p, s, f) waitpid_child(s, f)
 #endif
 
-#define DOWAIT_NONBLOCK 0
-#define DOWAIT_BLOCK    1
-#define DOWAIT_BLOCK_OR_SIG 2
+/* Inside dowait(): */
+#define DOWAIT_NONBLOCK 0	/* waitpid() will use WNOHANG and won't wait for signals */
+#define DOWAIT_BLOCK    1	/* waitpid() will NOT use WNOHANG */
+#define DOWAIT_CHILD_OR_SIG 2	/* waitpid() will use WNOHANG and if got 0, will wait for signals, then loop back */
 #if BASH_WAIT_N
-# define DOWAIT_JOBSTATUS 0x10   /* OR this to get job's exitstatus instead of pid */
+# define DOWAIT_JOBSTATUS 0x10  /* OR this to get job's exitstatus instead of pid */
 #endif
 
 static int
@@ -5001,40 +5117,48 @@ waitproc(int block, int *status)
 	int err;
 
 #if JOBS
-	if (doing_jobctl)
+	if (jobctl)
 		flags |= WUNTRACED;
 #endif
 
 	do {
-		got_sigchld = 0;
+		gotsigchld = 0;
 		do
 			err = waitpid(-1, status, flags);
 		while (err < 0 && errno == EINTR);
 
+		/* Return if error (for example, ECHILD); or if pid found;
+		 * or if "block" is DOWAIT_NONBLOCK (=0), in this case return -1.
+		 */
 		if (err || (err = -!block))
 			break;
 
-		sigfillset(&oldmask);
-		sigprocmask2(SIG_SETMASK, &oldmask); /* mask is updated */
-		while (!got_sigchld && !pending_sig)
-			sigsuspend(&oldmask);
-		sigprocmask(SIG_SETMASK, &oldmask, NULL);
+		/* "block" is DOWAIT_CHILD_OR_SIG. All children are running
+		 * (waitpid(WNOHAG) above returned 0), wait for signals:
+		 */
+
 		//simpler, but unsafe: a signal can set pending_sig after check, but before pause():
-		//while (!got_sigchld && !pending_sig)
+		//while (!gotsigchld && !pending_sig)
 		//	pause();
 
-	} while (got_sigchld);
+		sigblockall(&oldmask);
+
+		while (!gotsigchld && !pending_sig)
+			sigsuspend(&oldmask);
+
+		sigclearmask();
+	} while (gotsigchld);
+	/* If we fall off the loop, err is 0, which means we got a !SIGCHLD signal */
 
 	return err;
 #else
-	int flags = block == DOWAIT_BLOCK ? 0 : WNOHANG;
+	// Only DOWAIT_NONBLOCK is non-blocking, other values block.
 	*status = 0;
-	return waitpid(-1, status, flags);
+	return waitpid_child(status, block != DOWAIT_NONBLOCK);
 #endif
 }
 
-static int
-waitone(int block, struct job *job)
+static int waitone(int block, struct job *job)
 {
 	int pid;
 	int status;
@@ -5047,25 +5171,25 @@ waitone(int block, struct job *job)
 
 	TRACE(("dowait(0x%x) called\n", block));
 
-	/* It's wrong to call waitpid() outside of INT_OFF region:
+	/* It's wrong to call waitpid() outside of INTOFF region:
 	 * signal can arrive just after syscall return and handler can
 	 * longjmp away, losing stop/exit notification processing.
 	 * Thus, for "jobs" builtin, and for waiting for a fg job,
-	 * we call waitpid() (blocking or non-blocking) inside INT_OFF.
+	 * we call waitpid() (blocking or non-blocking) inside INTOFF.
 	 *
 	 * However, for "wait" builtin it is wrong to simply call waitpid()
-	 * in INT_OFF region: "wait" needs to wait for any running job
+	 * in INTOFF region: "wait" needs to wait for any running job
 	 * to change state, but should exit on any trap too.
-	 * In INT_OFF region, a signal just before syscall entry can set
+	 * In INTOFF region, a signal just before syscall entry can set
 	 * pending_sig variables, but we can't check them, and we would
 	 * either enter a sleeping waitpid() (BUG), or need to busy-loop.
 	 *
-	 * Because of this, we run inside INT_OFF, but use a special routine
+	 * Because of this, we run inside INTOFF, but use a special routine
 	 * which combines waitpid() and sigsuspend().
 	 * This is the reason why we need to have a handler for SIGCHLD:
 	 * SIG_DFL handler does not wake sigsuspend().
 	 */
-	INT_OFF;
+	INTOFF;
 	pid = waitproc(block, &status);
 	TRACE(("wait returns pid %d, status=%d\n", pid, status));
 	if (pid <= 0)
@@ -5073,36 +5197,34 @@ waitone(int block, struct job *job)
 
 	for (jp = curjob; jp; jp = jp->prev_job) {
 		int jobstate;
-		struct procstat *ps;
-		struct procstat *psend;
+		struct procstat *sp;
+		struct procstat *spend;
 		if (jp->state == JOBDONE)
 			continue;
 		jobstate = JOBDONE;
-		ps = jp->ps;
-		psend = ps + jp->nprocs;
+		spend = jp->ps + jp->nprocs;
+		sp = jp->ps;
 		do {
-			if (ps->ps_pid == pid) {
-				TRACE(("Job %d: changing status of proc %d "
-					"from 0x%x to 0x%x\n",
-					jobno(jp), pid, ps->ps_status, status));
-				ps->ps_status = status;
+			if (sp->ps_pid == pid) {
+				TRACE(("Job %d: changing status of proc %d from 0x%x to 0x%x\n", jobno(jp), pid, sp->ps_status, status));
+				sp->ps_status = status;
 				thisjob = jp;
 #if ENABLE_PLATFORM_MINGW32
-				CloseHandle(ps->ps_proc);
-				ps->ps_proc = NULL;
+				CloseHandle(sp->ps_proc);
+				sp->ps_proc = NULL;
 #endif
 			}
-			if (ps->ps_status == -1)
+			if (sp->ps_status == -1)
 				jobstate = JOBRUNNING;
 #if JOBS
 			if (jobstate == JOBRUNNING)
 				continue;
-			if (WIFSTOPPED(ps->ps_status)) {
-				jp->stopstatus = ps->ps_status;
+			if (WIFSTOPPED(sp->ps_status)) {
+				jp->stopstatus = sp->ps_status;
 				jobstate = JOBSTOPPED;
 			}
 #endif
-		} while (++ps < psend);
+		} while (++sp < spend);
 		if (!thisjob)
 			continue;
 
@@ -5114,8 +5236,7 @@ waitone(int block, struct job *job)
 			 */
 			thisjob->changed = 1;
 			if (thisjob->state != jobstate) {
-				TRACE(("Job %d: changing state from %d to %d\n",
-					jobno(thisjob), thisjob->state, jobstate));
+				TRACE(("Job %d: changing state from %d to %d\n", jobno(thisjob), thisjob->state, jobstate));
 				thisjob->state = jobstate;
 #if JOBS
 				if (jobstate == JOBSTOPPED)
@@ -5127,7 +5248,7 @@ waitone(int block, struct job *job)
 	}
 	/* The process wasn't found in job list */
  out:
-	INT_ON;
+	INTON;
 
 #if BASH_WAIT_N
 	if (want_jobexitstatus) {
@@ -5150,11 +5271,10 @@ waitone(int block, struct job *job)
 	return pid;
 }
 
-static int
-dowait(int block, struct job *jp)
+static int dowait(int block, struct job *jp)
 {
 #if !ENABLE_PLATFORM_MINGW32
-	smallint gotchld = *(volatile smallint *)&got_sigchld;
+	smallint gotchld = *(volatile smallint *)&gotsigchld;
 	int rpid;
 	int pid;
 
@@ -5178,7 +5298,7 @@ dowait(int block, struct job *jp)
 #else
 	int pid = 1;
 
-	while (jp ? jp->state == JOBRUNNING : pid > 0)
+	while ((jp ? jp->state == JOBRUNNING : pid > 0) && waitcmd_int != 1)
 		pid = waitone(block, jp);
 
 	return pid;
@@ -5391,17 +5511,28 @@ waitcmd(int argc UNUSED_PARAM, char **argv)
 	 * with an exit status greater than 128, immediately after which
 	 * the trap is executed."
 	 */
+#if ENABLE_PLATFORM_MINGW32
+			waitcmd_int = -1;
+#endif
 #if BASH_WAIT_N
-			status = dowait(DOWAIT_BLOCK_OR_SIG | DOWAIT_JOBSTATUS, NULL);
+			status = dowait(DOWAIT_CHILD_OR_SIG | DOWAIT_JOBSTATUS, NULL);
 #else
-			dowait(DOWAIT_BLOCK_OR_SIG, NULL);
+			dowait(DOWAIT_CHILD_OR_SIG, NULL);
 #endif
 			/* if child sends us a signal *and immediately exits*,
 			 * dowait() returns pid > 0. Check this case,
 			 * not "if (dowait() < 0)"!
 			 */
+#if ENABLE_PLATFORM_MINGW32
+			if (waitcmd_int == 1) {
+				write_ctrl_c();
+				return 128 | SIGINT;
+			}
+			waitcmd_int = 0;
+#else
 			if (pending_sig)
 				goto sigout;
+#endif
 #if BASH_WAIT_N
 			if (one) {
 				/* wait -n waits for one _job_, not one _process_.
@@ -5435,7 +5566,7 @@ waitcmd(int argc UNUSED_PARAM, char **argv)
 			job = getjob(*argv, 0);
 		}
 		/* loop until process terminated or stopped */
-		dowait(DOWAIT_BLOCK_OR_SIG, job);
+		dowait(DOWAIT_CHILD_OR_SIG, job);
 		if (pending_sig)
 			goto sigout;
 		job->waited = 1;
@@ -5513,7 +5644,7 @@ makejob(int nprocs)
 		if (jp->state != JOBDONE || !jp->waited)
 			continue;
 #if JOBS || JOBS_WIN32
-		if (doing_jobctl)
+		if (jobctl)
 			continue;
 #endif
 		freejob(jp);
@@ -5522,8 +5653,8 @@ makejob(int nprocs)
 	memset(jp, 0, sizeof(*jp));
 #if JOBS
 	/* jp->jobctl is a bitfield.
-	 * "jp->jobctl |= doing_jobctl" likely to give awful code */
-	if (doing_jobctl)
+	 * "jp->jobctl |= jobctl" likely to give awful code */
+	if (jobctl)
 		jp->jobctl = 1;
 #endif
 	jp->prev_job = curjob;
@@ -5773,6 +5904,9 @@ cmdtxt(union node *n)
 	case NXHERE:
 		p = "<<...";
 		goto dotail2;
+	case NFROMSTR:
+		p = "<<<";
+		goto dotail2;
 	case NCASE:
 		cmdputs("case ");
 		cmdputs(n->ncase.expr->narg.text);
@@ -5860,7 +5994,7 @@ clear_traps(void)
 {
 	char **tp;
 
-	INT_OFF;
+	INTOFF;
 	for (tp = trap; tp <= &trap[NTRAP_LAST]; tp++) {
 		if (*tp && **tp) {      /* trap not NULL or "" (SIG_IGN) */
 			if (trap_ptr == trap)
@@ -5872,7 +6006,7 @@ clear_traps(void)
 		}
 	}
 	may_have_traps = 0;
-	INT_ON;
+	INTON;
 }
 
 #if !ENABLE_PLATFORM_MINGW32
@@ -5884,17 +6018,27 @@ static void closescript(void);
 static NOINLINE void
 forkchild(struct job *jp, union node *n, int mode)
 {
+	int lvforked;
 	int oldlvl;
 
 	TRACE(("Child shell %d\n", getpid()));
 	oldlvl = shlvl;
-	shlvl++;
+	lvforked = vforked;
+
+	if (!lvforked) {
+		shlvl++;
+
+		closescript();
+
+#if JOBS
+		/* do job control only in root shell */
+		jobctl = 0;
+#endif
+	}
 
 	/* man bash: "Non-builtin commands run by bash have signal handlers
 	 * set to the values inherited by the shell from its parent".
 	 * Do we do it correctly? */
-
-	closescript();
 
 	if (n && n->type == NCMD        /* is it single cmd? */
 	/* && n->ncmd.args->type == NARG - always true? */
@@ -5941,10 +6085,9 @@ forkchild(struct job *jp, union node *n, int mode)
 		trap_ptr = xmemdup(trap, sizeof(trap));
 		/* Fall through into clearing traps */
 	}
-	clear_traps();
+	if (!lvforked)
+		clear_traps();
 #if JOBS
-	/* do job control only in root shell */
-	doing_jobctl = 0;
 	if (mode != FORK_NOJOB && jp->jobctl && oldlvl == 0) {
 		pid_t pgrp;
 
@@ -5967,8 +6110,7 @@ forkchild(struct job *jp, union node *n, int mode)
 		ignoresig(SIGQUIT);
 		if (jp->nprocs == 0) {
 			close(0);
-			if (open(bb_dev_null, O_RDONLY) != 0)
-				ash_msg_and_raise_perror("can't open '%s'", bb_dev_null);
+			sh_open(_PATH_DEVNULL, O_RDONLY, 0);
 		}
 	}
 	if (oldlvl == 0) {
@@ -5999,6 +6141,10 @@ forkchild(struct job *jp, union node *n, int mode)
 		return;
 	}
 #endif
+
+	if (lvforked)
+		return;
+
 	for (jp = curjob; jp; jp = jp->prev_job)
 		freejob(jp);
 }
@@ -6017,8 +6163,17 @@ forkparent(struct job *jp, union node *n, int mode, HANDLE proc)
 {
 #if ENABLE_PLATFORM_MINGW32
 	pid_t pid = GetProcessId(proc);
+#else
+	if (pid < 0) {
+		TRACE(("Fork failed, errno=%d", errno));
+		if (jp)
+			freejob(jp);
+		ash_msg_and_raise_perror("can't fork");
+		/* NOTREACHED */
+	}
 #endif
-	TRACE(("In parent shell: child = %d\n", pid));
+
+	TRACE(("In parent shell:  child = %d\n", pid));
 	if (!jp) /* jp is NULL when called by openhere() for heredoc support */
 		return;
 #if JOBS
@@ -6052,7 +6207,7 @@ forkparent(struct job *jp, union node *n, int mode, HANDLE proc)
 		ps->ps_proc = proc;
 #endif
 #if JOBS || JOBS_WIN32
-		if (doing_jobctl && n)
+		if (jobctl && n)
 			ps->ps_cmd = commandtext(n);
 #endif
 	}
@@ -6067,19 +6222,42 @@ forkshell(struct job *jp, union node *n, int mode)
 
 	TRACE(("forkshell(%%%d, %p, %d) called\n", jobno(jp), n, mode));
 	pid = fork();
-	if (pid < 0) {
-		TRACE(("Fork failed, errno=%d", errno));
-		if (jp)
-			freejob(jp);
-		ash_msg_and_raise_perror("can't fork");
-	}
 	if (pid == 0) {
 		CLEAR_RANDOM_T(&random_gen); /* or else $RANDOM repeats in child */
 		forkchild(jp, n, mode);
-	} else {
+	} else
 		forkparent(jp, n, mode, pid);
-	}
+
 	return pid;
+}
+
+static void shellexec(char *prog, char **argv, const char *path, int idx) NORETURN;
+
+static struct job*
+vforkexec(union node *n, char **argv, const char *path, int idx)
+{
+	struct job *jp;
+	int pid;
+
+	jp = makejob(1);
+
+	sigblockall(NULL);
+	vforked = 1;
+
+	pid = vfork();
+
+	if (!pid) {
+		forkchild(jp, n, FORK_FG);
+		sigclearmask();
+		shellexec(argv[0], argv, path, idx);
+		/* NOTREACHED */
+	}
+
+	vforked = 0;
+	sigclearmask();
+	forkparent(jp, n, FORK_FG, pid);
+
+	return jp;
 }
 #endif
 
@@ -6219,26 +6397,11 @@ stoppedjobs(void)
  * data to a pipe.  If the document is short, we can stuff the data in
  * the pipe without forking.
  */
-/* openhere needs this forward reference */
-static void expandhere(union node *arg);
 static int
-openhere(union node *redir)
+write2pipe(int pip[2], const char *p, size_t len)
 {
-	char *p;
-	int pip[2];
-	size_t len = 0;
 	IF_PLATFORM_MINGW32(struct forkshell fs);
 
-	if (pipe(pip) < 0)
-		ash_msg_and_raise_perror("can't create pipe");
-
-	p = redir->nhere.doc->narg.text;
-	if (redir->type == NXHERE) {
-		expandhere(redir->nhere.doc);
-		p = stackblock();
-	}
-
-	len = strlen(p);
 	if (len <= PIPE_BUF) {
 		xwrite(pip[1], p, len);
 		goto out;
@@ -6269,89 +6432,113 @@ openhere(union node *redir)
 	return pip[0];
 }
 
+/* openhere needs this forward reference */
+static void expandhere(union node *arg);
+static int
+openhere(union node *redir)
+{
+	char *p;
+	int pip[2];
+
+	if (pipe(pip) < 0)
+		ash_msg_and_raise_perror("can't create pipe");
+
+	p = redir->nhere.doc->narg.text;
+	if (redir->type == NXHERE) {
+		expandhere(redir->nhere.doc);
+		p = stackblock();
+	}
+
+	return write2pipe(pip, p, strlen(p));
+}
+
+static int
+openherestr(char *str)
+{
+	int pip[2];
+	size_t len;
+
+	if (pipe(pip) < 0)
+		ash_msg_and_raise_perror("can't create pipe");
+
+	len = strlen(str);
+	str[len] = '\n';
+	write2pipe(pip, str, len + 1);
+	str[len] = '\0';
+	return pip[0];
+}
+
 static int
 openredirect(union node *redir)
 {
 	struct stat sb;
 	char *fname;
+	int flags;
 	int f;
 
 	switch (redir->nfile.type) {
-/* Can't happen, our single caller does this itself */
-//	case NTOFD:
-//	case NFROMFD:
-//		return -1;
-	case NHERE:
-	case NXHERE:
-		return openhere(redir);
-	}
-
-	/* For N[X]HERE, reading redir->nfile.expfname would touch beyond
-	 * allocated space. Do it only when we know it is safe.
-	 */
-	fname = redir->nfile.expfname;
-
-	switch (redir->nfile.type) {
-	default:
-#if DEBUG
-		abort();
-#endif
 	case NFROM:
-		f = open(fname, O_RDONLY);
-		if (f < 0)
-			goto eopen;
+		flags = O_RDONLY;
+ do_open:
+		f = sh_open(redir->nfile.expfname, flags, 0);
+#if ENABLE_PLATFORM_MINGW32
+		if (redir->nfile.type == NAPPEND)
+			lseek(f, 0, SEEK_END);
+#endif
+		break;
+	case NFROMSTR:
+		f = openherestr(redir->nfile.expfname);
 		break;
 	case NFROMTO:
-		f = open(fname, O_RDWR|O_CREAT, 0666);
-		if (f < 0)
-			goto ecreate;
-		break;
+		flags = O_RDWR|O_CREAT;
+		goto do_open;
 	case NTO:
 #if BASH_REDIR_OUTPUT
 	case NTO2:
 #endif
 		/* Take care of noclobber mode. */
 		if (Cflag) {
+			fname = redir->nfile.expfname;
 			if (stat(fname, &sb) < 0) {
-				f = open(fname, O_WRONLY|O_CREAT|O_EXCL, 0666);
-				if (f < 0)
-					goto ecreate;
-			} else if (!S_ISREG(sb.st_mode)) {
-				f = open(fname, O_WRONLY, 0666);
-				if (f < 0)
-					goto ecreate;
-				if (!fstat(f, &sb) && S_ISREG(sb.st_mode)) {
-					close(f);
-					errno = EEXIST;
-					goto ecreate;
-				}
-			} else {
-				errno = EEXIST;
+				flags = O_WRONLY|O_CREAT|O_EXCL;
+				goto do_open;
+			}
+
+			if (S_ISREG(sb.st_mode))
+				goto ecreate;
+
+			f = sh_open(fname, O_WRONLY, 0);
+			if (!fstat(f, &sb) && S_ISREG(sb.st_mode)) {
+				close(f);
 				goto ecreate;
 			}
 			break;
 		}
 		/* FALLTHROUGH */
 	case NCLOBBER:
-		f = open(fname, O_WRONLY|O_CREAT|O_TRUNC, 0666);
-		if (f < 0)
-			goto ecreate;
-		break;
+		flags = O_WRONLY|O_CREAT|O_TRUNC;
+		goto do_open;
 	case NAPPEND:
-		f = open(fname, O_WRONLY|O_CREAT|O_APPEND, 0666);
-		if (f < 0)
-			goto ecreate;
-#if ENABLE_PLATFORM_MINGW32
-		lseek(f, 0, SEEK_END);
+		flags = O_WRONLY|O_CREAT|O_APPEND;
+		goto do_open;
+/* Can't happen, our single caller does this itself */
+//	case NTOFD:
+//	case NFROMFD:
+//		return -1;
+	default:
+#ifdef DEBUG
+		abort();
 #endif
+		/* Fall through to eliminate warning. */
+	case NHERE:
+	case NXHERE:
+		f = openhere(redir);
 		break;
 	}
 
 	return f;
  ecreate:
-	ash_msg_and_raise_error("can't create %s: %s", fname, errmsg(errno, "nonexistent directory"));
- eopen:
-	ash_msg_and_raise_error("can't open %s: %s", fname, errmsg(errno, "no such file"));
+	sh_open_fail(fname, O_CREAT, EEXIST);
 }
 
 /*
@@ -6604,7 +6791,7 @@ redirect(union node *redir, int flags)
 		return;
 
 	sv = NULL;
-	INT_OFF;
+	INTOFF;
 	if (flags & REDIR_PUSH)
 		sv = redirlist;
 	do {
@@ -6669,7 +6856,7 @@ redirect(union node *redir, int flags)
 #endif
 		}
 	} while ((redir = redir->nfile.next) != NULL);
-	INT_ON;
+	INTON;
 
 //dash:#define REDIR_SAVEFD2 03        /* set preverrout */
 #define REDIR_SAVEFD2 0
@@ -6757,7 +6944,7 @@ popredir(int drop)
 
 	if (redirlist == NULL)
 		return;
-	INT_OFF;
+	INTOFF;
 	rp = redirlist;
 	for (i = 0; i < rp->pair_count; i++) {
 		int fd = rp->two_fd[i].orig_fd;
@@ -6777,7 +6964,7 @@ popredir(int drop)
 	}
 	redirlist = rp->next;
 	free(rp);
-	INT_ON;
+	INTON;
 }
 
 static void
@@ -6804,11 +6991,11 @@ ash_arith(const char *s)
 	math_state.setvar    = setvar0;
 	//math_state.endofname = endofname;
 
-	INT_OFF;
+	INTOFF;
 	result = arith(&math_state, s);
 	if (math_state.errmsg)
 		ash_msg_and_raise_error(math_state.errmsg);
-	INT_ON;
+	INTON;
 
 	return result;
 }
@@ -7029,7 +7216,7 @@ ifsfree(void)
 	if (!p)
 		goto out;
 
-	INT_OFF;
+	INTOFF;
 	do {
 		struct ifsregion *ifsp;
 		ifsp = p->next;
@@ -7037,7 +7224,7 @@ ifsfree(void)
 		p = ifsp;
 	} while (p);
 	ifsfirst.next = NULL;
-	INT_ON;
+	INTON;
  out:
 	ifslastp = NULL;
 }
@@ -7252,11 +7439,11 @@ recordregion(int start, int end, int nulonly)
 	if (ifslastp == NULL) {
 		ifsp = &ifsfirst;
 	} else {
-		INT_OFF;
+		INTOFF;
 		ifsp = ckzalloc(sizeof(*ifsp));
 		/*ifsp->next = NULL; - ckzalloc did it */
 		ifslastp->next = ifsp;
-		INT_ON;
+		INTON;
 	}
 	ifslastp = ifsp;
 	ifslastp->begoff = start;
@@ -7273,11 +7460,11 @@ removerecordregions(int endoff)
 	if (ifsfirst.endoff > endoff) {
 		while (ifsfirst.next) {
 			struct ifsregion *ifsp;
-			INT_OFF;
+			INTOFF;
 			ifsp = ifsfirst.next->next;
 			free(ifsfirst.next);
 			ifsfirst.next = ifsp;
-			INT_ON;
+			INTON;
 		}
 		if (ifsfirst.begoff > endoff) {
 			ifslastp = NULL;
@@ -7293,11 +7480,11 @@ removerecordregions(int endoff)
 		ifslastp = ifslastp->next;
 	while (ifslastp->next) {
 		struct ifsregion *ifsp;
-		INT_OFF;
+		INTOFF;
 		ifsp = ifslastp->next->next;
 		free(ifslastp->next);
 		ifslastp->next = ifsp;
-		INT_ON;
+		INTON;
 	}
 	if (ifslastp->endoff > endoff)
 		ifslastp->endoff = endoff;
@@ -7422,7 +7609,8 @@ evalbackcmd(union node *n, struct backcmd *result
 #else
 	if (forkshell(jp, n, FORK_NOJOB) == 0) {
 		/* child */
-		FORCE_INT_ON;
+		reset_exception_handler();
+		FORCEINTON;
 		close(pip[ip]);
 		/* ic is index of child end of pipe *and* fd to connect it to */
 		if (pip[ic] != ic) {
@@ -7484,7 +7672,7 @@ expbackq(union node *cmd, int flag IF_BASH_PROCESS_SUBST(, int ctl))
 	if (flag & EXP_DISCARD)
 		goto out;
 
-	INT_OFF;
+	INTOFF;
 	startloc = expdest - (char *)stackblock();
 	pushstackmark(&smark, startloc);
 	evalbackcmd(cmd, &in IF_BASH_PROCESS_SUBST(, ctl));
@@ -7518,7 +7706,7 @@ expbackq(union node *cmd, int flag IF_BASH_PROCESS_SUBST(, int ctl))
 		back_exitstatus = waitforjob(in.jp);
 	}
  done:
-	INT_ON;
+	INTON;
 
 	/* Eat all trailing newlines */
 	dest = expdest;
@@ -8622,7 +8810,7 @@ expandmeta(struct strlist *str /*, int flag*/)
 		if (!hasmeta(str->text))
 			goto nometa;
 
-		INT_OFF;
+		INTOFF;
 		p = preglob(str->text, RMESCAPE_ALLOC | RMESCAPE_HEAP);
 // GLOB_NOMAGIC (GNU): if no *?[ chars in pattern, return it even if no match
 // GLOB_NOCHECK: if no match, return unchanged pattern (sans \* escapes?)
@@ -8653,12 +8841,12 @@ expandmeta(struct strlist *str /*, int flag*/)
 #endif
 			addglob(&pglob);
 			globfree(&pglob);
-			INT_ON;
+			INTON;
 			break;
 		case GLOB_NOMATCH:
  //nometa2:
 			globfree(&pglob);
-			INT_ON;
+			INTON;
  nometa:
 			*exparg.lastp = str;
 			rmescapes(str->text, 0, NULL);
@@ -8666,7 +8854,7 @@ expandmeta(struct strlist *str /*, int flag*/)
 			break;
 		default:	/* GLOB_NOSPACE */
 			globfree(&pglob);
-			INT_ON;
+			INTON;
 			ash_msg_and_raise_error(bb_msg_memory_exhausted);
 		}
 		str = str->next;
@@ -8926,7 +9114,7 @@ expandmeta(struct strlist *str /*, int flag*/)
 			goto nometa;
 		savelastp = exparg.lastp;
 
-		INT_OFF;
+		INTOFF;
 		p = preglob(str->text, RMESCAPE_ALLOC | RMESCAPE_HEAP);
 		len = strlen(p);
 		exp.dir_max = len + PATH_MAX;
@@ -8936,7 +9124,7 @@ expandmeta(struct strlist *str /*, int flag*/)
 		free(exp.dir);
 		if (p != str->text)
 			free(p);
-		INT_ON;
+		INTON;
 		if (exparg.lastp == savelastp) {
 			/*
 			 * no matches
@@ -9139,7 +9327,7 @@ tryexec(IF_FEATURE_SH_STANDALONE(int applet_no,) const char *cmd, char **argv, c
 				argv[0] = (char *)"Which";
 			}
 # else
-		if (APPLET_IS_NOEXEC(applet_no)) {
+		if (!vforked && APPLET_IS_NOEXEC(applet_no)) {
 # endif
 #if !ENABLE_PLATFORM_MINGW32 || !defined(_UCRT)
 			/* If building for UCRT move this up into shellexec() to
@@ -9243,9 +9431,11 @@ tryexec(IF_FEATURE_SH_STANDALONE(int applet_no,) const char *cmd, char **argv, c
  * have to change the find_command routine as well.
  * argv[-1] must exist and be writable! See tryexec() for why.
  */
+#if ENABLE_PLATFORM_MINGW32
 static struct builtincmd *find_builtin(const char *name);
 static void shellexec(char *prog, char **argv, const char *path, int idx,
 						int noexec) NORETURN;
+#endif
 static void shellexec(char *prog, char **argv, const char *path, int idx,
 						int noexec)
 {
@@ -9336,7 +9526,7 @@ static void shellexec(char *prog, char **argv, const char *path, int idx,
 	exitstatus = exerrno;
 	TRACE(("shellexec failed for %s, errno %d, suppress_int %d\n",
 		prog, e, suppress_int));
-	ash_msg_and_raise(EXEND, "%s: %s", prog, errmsg(e, "not found"));
+	ash_msg_and_raise(EXEND, "%s: %s", prog, errmsg(e, E_EXEC));
 	/* NOTREACHED */
 }
 
@@ -9369,7 +9559,7 @@ clearcmdentry(void)
 	struct tblentry **pp;
 	struct tblentry *cmdp;
 
-	INT_OFF;
+	INTOFF;
 	for (tblp = cmdtable; tblp < &cmdtable[CMDTABLESIZE]; tblp++) {
 		pp = tblp;
 		while ((cmdp = *pp) != NULL) {
@@ -9386,7 +9576,7 @@ clearcmdentry(void)
 			}
 		}
 	}
-	INT_ON;
+	INTON;
 }
 
 /*
@@ -9440,13 +9630,13 @@ delete_cmd_entry(void)
 {
 	struct tblentry *cmdp;
 
-	INT_OFF;
+	INTOFF;
 	cmdp = *lastcmdentry;
 	*lastcmdentry = cmdp->next;
 	if (cmdp->cmdtype == CMDFUNCTION)
 		freefunc(cmdp->param.func);
 	free(cmdp);
-	INT_ON;
+	INTON;
 }
 
 /*
@@ -10036,6 +10226,7 @@ calcsize(int funcblocksize, union node *n)
 #endif
 	case NCLOBBER:
 	case NFROM:
+	case NFROMSTR:
 	case NFROMTO:
 	case NAPPEND:
 		funcblocksize = calcsize(funcblocksize, n->nfile.fname);
@@ -10252,6 +10443,7 @@ copynode(union node *n)
 #endif
 	case NCLOBBER:
 	case NFROM:
+	case NFROMSTR:
 	case NFROMTO:
 	case NAPPEND:
 		new->nfile.fname = copynode(n->nfile.fname);
@@ -10314,11 +10506,11 @@ defun(union node *func)
 {
 	struct cmdentry entry;
 
-	INT_OFF;
+	INTOFF;
 	entry.cmdtype = CMDFUNCTION;
 	entry.u.func = copyfunc(func);
 	addcmdentry(func->ndefun.text, &entry);
-	INT_ON;
+	INTON;
 }
 
 /* Reasons for skipping commands (see comment on breakcmd routine) */
@@ -10402,8 +10594,10 @@ dotrap(void)
 	int status, last_status;
 	char *p;
 
-	if (!pending_int)
+	if (!pending_int && waitcmd_int != 1) {
+		waitcmd_int = 0;
 		return;
+	}
 
 	status = savestatus;
 	last_status = status;
@@ -10411,7 +10605,7 @@ dotrap(void)
 		status = exitstatus;
 		savestatus = status;
 	}
-	pending_int = 0;
+	pending_int = waitcmd_int = 0;
 	barrier();
 
 	TRACE(("dotrap entered\n"));
@@ -10729,6 +10923,7 @@ evalsubshell(union node *n, int flags)
 
 #if ENABLE_PLATFORM_MINGW32
 	if (!backgnd && (flags & EV_EXIT) && !may_have_traps) {
+		reset_exception_handler();
 		expredir(n->nredir.redirect);
 		redirect(n->nredir.redirect, 0);
 		evaltreenr(n->nredir.n, flags);
@@ -10739,7 +10934,7 @@ evalsubshell(union node *n, int flags)
 	if (!backgnd && (flags & EV_EXIT) && !may_have_traps)
 		goto nofork;
 #endif
-	INT_OFF;
+	INTOFF;
 	if (backgnd == FORK_FG)
 		get_tty_state();
 	jp = makejob(1);
@@ -10752,11 +10947,12 @@ evalsubshell(union node *n, int flags)
 #else
 	if (forkshell(jp, n, backgnd) == 0) {
 		/* child */
-		INT_ON;
+		INTON;
 		flags |= EV_EXIT;
 		if (backgnd)
 			flags &= ~EV_TESTED;
  nofork:
+		reset_exception_handler();
 		redirect(n->nredir.redirect, 0);
 		evaltreenr(n->nredir.n, flags);
 		/* never returns */
@@ -10766,7 +10962,7 @@ evalsubshell(union node *n, int flags)
 	status = 0;
 	if (backgnd == FORK_FG)
 		status = waitforjob(jp);
-	INT_ON;
+	INTON;
 	return status;
 }
 
@@ -10787,6 +10983,7 @@ expredir(union node *n)
 		switch (redir->type) {
 		case NFROMTO:
 		case NFROM:
+		case NFROMSTR:
 		case NTO:
 #if BASH_REDIR_OUTPUT
 		case NTO2:
@@ -10855,7 +11052,7 @@ evalpipe(union node *n, int flags)
 	for (lp = n->npipe.cmdlist; lp; lp = lp->next)
 		pipelen++;
 	flags |= EV_EXIT;
-	INT_OFF;
+	INTOFF;
 	if (n->npipe.pipe_backgnd == 0)
 		get_tty_state();
 	jp = makejob(pipelen);
@@ -10881,7 +11078,8 @@ evalpipe(union node *n, int flags)
 #else
 		if (forkshell(jp, lp->n, n->npipe.pipe_backgnd) == 0) {
 			/* child */
-			INT_ON;
+			reset_exception_handler();
+			INTON;
 			if (pip[1] >= 0) {
 				close(pip[0]);
 			}
@@ -10909,7 +11107,7 @@ evalpipe(union node *n, int flags)
 		status = waitforjob(jp);
 		TRACE(("evalpipe:  job done exit status %d\n", status));
 	}
-	INT_ON;
+	INTON;
 
 	return status;
 }
@@ -11013,7 +11211,7 @@ poplocalvars(int keep)
 	int var_type;
 #endif
 
-	INT_OFF;
+	INTOFF;
 	ll = localvar_stack;
 	localvar_stack = ll->next;
 
@@ -11068,7 +11266,7 @@ poplocalvars(int keep)
 		}
 		free(lvp);
 	}
-	INT_ON;
+	INTON;
 }
 
 /*
@@ -11084,12 +11282,12 @@ pushlocalvars(int push)
 	if (!push)
 		goto out;
 
-	INT_OFF;
+	INTOFF;
 	ll = ckzalloc(sizeof(*ll));
 	/*ll->lv = NULL; - zalloc did it */
 	ll->next = top;
 	localvar_stack = ll;
-	INT_ON;
+	INTON;
  out:
 	return top;
 }
@@ -11126,13 +11324,13 @@ evalfun(struct funcnode *func, int argc, char **argv, int flags)
 	if (e) {
 		goto funcdone;
 	}
-	INT_OFF;
+	INTOFF;
 	exception_handler = &jmploc;
 	shellparam.malloced = 0;
 	func->count++;
 	funcname = func->n.ndefun.text;
 	funcline = func->n.ndefun.linno;
-	INT_ON;
+	INTON;
 	shellparam.nparam = argc - 1;
 	shellparam.p = argv + 1;
 #if ENABLE_ASH_GETOPTS
@@ -11141,7 +11339,7 @@ evalfun(struct funcnode *func, int argc, char **argv, int flags)
 #endif
 	evaltree(func->n.ndefun.body, flags & EV_TESTED);
  funcdone:
-	INT_OFF;
+	INTOFF;
 	funcname = savefuncname;
 	if (savetrap) {
 		if (!trap[NTRAP_ERR])
@@ -11155,7 +11353,7 @@ evalfun(struct funcnode *func, int argc, char **argv, int flags)
 	freeparam(&shellparam);
 	shellparam = saveparam;
 	exception_handler = savehandler;
-	INT_ON;
+	INTON;
 	evalskip &= ~(SKIPFUNC | SKIPFUNCDEF);
 	return e;
 }
@@ -11174,7 +11372,7 @@ mklocal(char *name, int flags)
 	struct var *vp;
 	char *eq = strchr(name, '=');
 
-	INT_OFF;
+	INTOFF;
 	/* Cater for duplicate "local". Examples:
 	 * x=0; f() { local x=1; echo $x; local x; echo $x; }; f; echo $x
 	 * x=0; f() { local x=1; echo $x; local x=2; echo $x; }; f; echo $x
@@ -11225,7 +11423,7 @@ mklocal(char *name, int flags)
 	lvp->next = localvar_stack->lv;
 	localvar_stack->lv = lvp;
  ret:
-	INT_ON;
+	INTON;
 }
 
 /*
@@ -11783,7 +11981,7 @@ evalcommand(union node *cmd, int flags)
 			char *sv_argv0;
 #endif
 
-			INT_OFF;
+			INTOFF;
 			sv_environ = environ;
 			environ = listvars(VEXPORT, VUNSET, varlist.list, /*end:*/ NULL);
 			/*
@@ -11813,10 +12011,11 @@ evalcommand(union node *cmd, int flags)
 			 * our signals to SA_RESTART?
 			 */
 			/*clearerr(stdout);*/
-			INT_ON;
+			INTON;
 			break;
 		}
 #endif
+		/* Fork off a child process if necessary. */
 		/* Can we avoid forking? For example, very last command
 		 * in a script or a subshell does not need forking,
 		 * we can just exec it.
@@ -11826,7 +12025,7 @@ evalcommand(union node *cmd, int flags)
 			/* No, forking off a child is necessary */
 			struct forkshell fs;
 
-			INT_OFF;
+			INTOFF;
 			memset(&fs, 0, sizeof(fs));
 			fs.fpid = FS_SHELLEXEC;
 			fs.argv = argv;
@@ -11839,16 +12038,10 @@ evalcommand(union node *cmd, int flags)
 #else
 		if (!(flags & EV_EXIT) || may_have_traps) {
 			/* No, forking off a child is necessary */
-			INT_OFF;
+			INTOFF;
 			get_tty_state();
-			jp = makejob(1);
-			if (forkshell(jp, cmd, FORK_FG) != 0) {
-				/* parent */
-				break;
-			}
-			/* child */
-			FORCE_INT_ON;
-			/* fall through to exec'ing external program */
+			jp = vforkexec(cmd, argv, path, cmdentry.u.index);
+			break;
 		}
 #endif
 		shellexec(argv[0], argv, path, cmdentry.u.index, FALSE);
@@ -11872,7 +12065,7 @@ evalcommand(union node *cmd, int flags)
 	status = waitforjob(jp);
 	if (jp)
 		TRACE(("forked child exited with %d\n", status));
-	FORCE_INT_ON;
+	FORCEINTON;
 
  out:
 	if (cmd->ncmd.redirect)
@@ -12009,7 +12202,7 @@ pushstring(char *s, struct alias *ap)
 	int len;
 
 	len = strlen(s);
-	INT_OFF;
+	INTOFF;
 	if (g_parsefile->strpush || g_parsefile->spfree) {
 		sp = ckzalloc(sizeof(*sp));
 		sp->prev = g_parsefile->strpush;
@@ -12033,14 +12226,14 @@ pushstring(char *s, struct alias *ap)
 	g_parsefile->left_in_line = len;
 	g_parsefile->unget = 0;
 	g_parsefile->spfree = NULL;
-	INT_ON;
+	INTON;
 }
 
 static void popstring(void)
 {
 	struct strpush *sp = g_parsefile->strpush;
 
-	INT_OFF;
+	INTOFF;
 #if ENABLE_ASH_ALIAS
 	if (sp->ap) {
 		if (g_parsefile->next_to_pgetc[-1] == ' '
@@ -12059,7 +12252,7 @@ static void popstring(void)
 	memcpy(g_parsefile->lastc, sp->lastc, sizeof(sp->lastc));
 	g_parsefile->strpush = sp->prev;
 	g_parsefile->spfree = sp;
-	INT_ON;
+	INTON;
 }
 
 #if ENABLE_PLATFORM_MINGW32
@@ -12156,11 +12349,11 @@ preadfd(void)
 		 * #(bash 5.0.17 exits after first "T", looks like a bug)
 		 */
 		bb_got_signal = 0;
-		INT_OFF; /* no longjmp'ing out of read_line_input please */
+		INTOFF; /* no longjmp'ing out of read_line_input please */
 		nr = read_line_input(line_input_state, cmdedit_prompt, buf, IBUFSIZ);
 		if (bb_got_signal == SIGINT)
 			write(STDOUT_FILENO, "^C\n", 3);
-		INT_ON; /* here non-blocked SIGINT will longjmp */
+		INTON; /* here non-blocked SIGINT will longjmp */
 		if (nr == 0) {
 			/* ^C pressed, "convert" to SIGINT */
 # if !ENABLE_PLATFORM_MINGW32
@@ -12170,7 +12363,6 @@ preadfd(void)
 			 * is SIG_IGNed on startup, it stays SIG_IGNed)
 			 */
 # else
-			raise_interrupt();
 			write(STDOUT_FILENO, "^C\n", 3);
 # endif
 			if (trap[SIGINT]) {
@@ -12183,6 +12375,10 @@ preadfd(void)
 				buf[1] = '\0';
 				return 1;
 			}
+# if ENABLE_PLATFORM_MINGW32
+			else
+				raise_interrupt();
+# endif
 			exitstatus = 128 + SIGINT;
 			/* bash behavior on ^C + ignored SIGINT: */
 			goto again;
@@ -12326,7 +12522,7 @@ nlnoprompt(void)
 
 static void freestrings(struct strpush *sp)
 {
-	INT_OFF;
+	INTOFF;
 	do {
 		struct strpush *psp;
 #if ENABLE_ASH_ALIAS
@@ -12345,7 +12541,7 @@ static void freestrings(struct strpush *sp)
 	} while (sp);
 
 	g_parsefile->spfree = NULL;
-	INT_ON;
+	INTON;
 }
 
 static int __pgetc(void)
@@ -12478,7 +12674,7 @@ popfile(void)
 	if (pf == &basepf)
 		return;
 
-	INT_OFF;
+	INTOFF;
 	if (pf->pf_fd >= 0)
 		close(pf->pf_fd);
 	free(pf->buf);
@@ -12490,7 +12686,7 @@ popfile(void)
 	}
 	g_parsefile = pf->prev;
 	free(pf);
-	INT_ON;
+	INTON;
 }
 
 static void
@@ -12553,14 +12749,10 @@ setinputfile(const char *fname, int flags)
 {
 	int fd;
 
-	INT_OFF;
-	fd = open(fname, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) {
-		if (flags & INPUT_NOFILE_OK)
-			goto out;
-		exitstatus = 127;
-		ash_msg_and_raise_perror("can't open '%s'", fname);
-	}
+	INTOFF;
+	fd = sh_open(fname, O_RDONLY, flags & INPUT_NOFILE_OK);
+	if (fd < 0)
+		goto out;
 	if (fd < 10)
 		fd = savefd(fd);
 	else if (O_CLOEXEC == 0) /* old libc */
@@ -12568,7 +12760,7 @@ setinputfile(const char *fname, int flags)
 
 	setinputfd(fd, flags & INPUT_PUSH_FILE);
  out:
-	INT_ON;
+	INTON;
 	return fd;
 }
 
@@ -12578,13 +12770,13 @@ setinputfile(const char *fname, int flags)
 static void
 setinputstring(char *string)
 {
-	INT_OFF;
+	INTOFF;
 	pushfile();
 	g_parsefile->next_to_pgetc = string;
 	g_parsefile->left_in_line = strlen(string);
 	g_parsefile->buf = NULL;
 	g_parsefile->linno = lineno;
-	INT_ON;
+	INTON;
 }
 
 
@@ -12880,7 +13072,7 @@ shiftcmd(int argc UNUSED_PARAM, char **argv)
 		n = number(argv[1]);
 	if (n > shellparam.nparam)
 		return 1;
-	INT_OFF;
+	INTOFF;
 	shellparam.nparam -= n;
 	for (ap1 = shellparam.p; --n >= 0; ap1++) {
 		if (shellparam.malloced)
@@ -12893,7 +13085,7 @@ shiftcmd(int argc UNUSED_PARAM, char **argv)
 	shellparam.optind = 1;
 	shellparam.optoff = -1;
 #endif
-	INT_ON;
+	INTON;
 	return 0;
 }
 
@@ -12947,7 +13139,7 @@ setcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 	if (!argv[1])
 		return showvars(nullstr, 0, VUNSET);
 
-	INT_OFF;
+	INTOFF;
 	retval = options(/*login_sh:*/ NULL);
 	if (retval == 0) { /* if no parse error... */
 		optschanged();
@@ -12955,7 +13147,7 @@ setcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 			setparam(argptr);
 		}
 	}
-	INT_ON;
+	INTON;
 	return retval;
 }
 
@@ -13365,7 +13557,7 @@ fixredir(union node *n, const char *text, int err)
 		 * silently truncate results to word width.
 		 */
 		if (err)
-			raise_error_syntax("bad fd number");
+			ash_msg_and_raise_error("bad fd number");
 		n->ndup.vname = makename();
 	}
 }
@@ -14172,6 +14364,11 @@ parseredir: {
 		c = pgetc_eatbnl();
 		switch (c) {
 		case '<':
+			c = pgetc_eatbnl();
+			if (c == '<') {
+				np->type = NFROMSTR;
+				break;
+			}
 			if (sizeof(struct nfile) != sizeof(struct nhere)) {
 				np = stzalloc(sizeof(struct nhere));
 				/*np->nfile.fd = 0; - stzalloc did it */
@@ -14179,7 +14376,6 @@ parseredir: {
 			np->type = NHERE;
 			heredoc = stzalloc(sizeof(struct heredoc));
 			heredoc->here = np;
-			c = pgetc_eatbnl();
 			if (c == '-') {
 				heredoc->striptabs = 1;
 			} else {
@@ -14957,7 +15153,7 @@ cmdloop(int top)
 
 		setstackmark(&smark);
 #if JOBS || JOBS_WIN32
-		if (doing_jobctl)
+		if (jobctl)
 			showjobs(SHOW_CHANGED|SHOW_STDERR);
 #endif
 		inter = 0;
@@ -15369,11 +15565,11 @@ find_command(char *name, struct cmdentry *entry, int act, const char *path)
 			entry->u.index = idx;
 			return;
 		}
-		INT_OFF;
+		INTOFF;
 		cmdp = cmdlookup(name, 1);
 		cmdp->cmdtype = CMDNORMAL;
 		cmdp->param.index = idx;
-		INT_ON;
+		INTON;
 		goto success;
 	}
 
@@ -15393,7 +15589,7 @@ find_command(char *name, struct cmdentry *entry, int act, const char *path)
 			return;
 		}
 #endif
-		ash_msg("%s: %s", name, errmsg(e, "not found"));
+		ash_msg("%s: %s", name, errmsg(e, E_EXEC));
 	}
  fail:
 	entry->cmdtype = CMDUNKNOWN;
@@ -15405,11 +15601,11 @@ find_command(char *name, struct cmdentry *entry, int act, const char *path)
 		entry->u.cmd = bcmd;
 		return;
 	}
-	INT_OFF;
+	INTOFF;
 	cmdp = cmdlookup(name, 1);
 	cmdp->cmdtype = CMDBUILTIN;
 	cmdp->param.cmd = bcmd;
-	INT_ON;
+	INTON;
  success:
 	cmdp->rehash = 0;
 	entry->cmdtype = cmdp->cmdtype;
@@ -15471,7 +15667,7 @@ trapcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 			exitcode = 1;
 			goto next;
 		}
-		INT_OFF;
+		INTOFF;
 		if (action) {
 			if (LONE_DASH(action))
 				action = NULL;
@@ -15508,7 +15704,7 @@ trapcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 		if (signo != 0 && signo < NSIG)
 			setsignal(signo);
 #endif
-		INT_ON;
+		INTON;
  next:
 		ap++;
 	}
@@ -15821,9 +16017,9 @@ readcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 	 * to jump out of it.
 	 */
  again:
-	INT_OFF;
+	INTOFF;
 	r = shell_builtin_read(&params);
-	INT_ON;
+	INTON;
 
 #if !ENABLE_PLATFORM_MINGW32
 	if ((uintptr_t)r == 1 && errno == EINTR) {
@@ -15845,7 +16041,7 @@ readcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 	} else if ((uintptr_t)r == 3) {
 		/* ^C pressed, propagate event */
 		if (trap[SIGINT]) {
-			write(STDOUT_FILENO, "^C", 2);
+			write_ctrl_c();
 			pending_int = 1;
 			dotrap();
 			if (!(rootshell && iflag))
@@ -15880,10 +16076,10 @@ umaskcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 		symbolic_mode = 1;
 	}
 
-	INT_OFF;
+	INTOFF;
 	mask = umask(0);
 	umask(mask);
-	INT_ON;
+	INTON;
 
 	if (*argptr == NULL) {
 		if (symbolic_mode) {
@@ -16058,11 +16254,13 @@ init(void)
 {
 #if ENABLE_PLATFORM_MINGW32
 	int import = 0;
-#else
+#endif
+
 	/* we will never free this */
 	basepf.next_to_pgetc = basepf.buf = ckzalloc(IBUFSIZ);
 	basepf.linno = 1;
 
+#if !ENABLE_PLATFORM_MINGW32
 	sigmode[SIGCHLD - 1] = S_DFL; /* ensure we install handler even if it is SIG_IGNed */
 	setsignal(SIGCHLD);
 #endif
@@ -16192,14 +16390,11 @@ init(void)
  * Process the shell command line arguments.
  */
 static int
-procargs(char **argv)
+procargs(char **xargv)
 {
 	int i;
-	const char *xminusc;
-	char **xargv;
 	int login_sh;
 
-	xargv = argv;
 #if ENABLE_PLATFORM_MINGW32
 	login_sh = applet_name[0] == 'l';
 #else
@@ -16220,9 +16415,8 @@ procargs(char **argv)
 		raise_exception(EXERROR); /* does not return */
 	}
 	xargv = argptr;
-	xminusc = minusc;
 	if (*xargv == NULL) {
-		if (xminusc)
+		if (minusc)
 			ash_msg_and_raise_error(bb_msg_requires_arg, "-c");
 		sflag = 1;
 	}
@@ -16244,7 +16438,7 @@ procargs(char **argv)
 	debug = 1;
 #endif
 	/* POSIX 1003.2: first arg after "-c CMD" is $0, remainder $1... */
-	if (xminusc) {
+	if (minusc) {
 		minusc = *xargv++;
 		if (*xargv)
 			goto setarg0;
@@ -16319,16 +16513,11 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 /* note: 'argc' is used only if embedded scripts are enabled */
 {
 	volatile smallint state;
-	struct jmploc jmploc;
 	struct stackmark smark;
 	int login_sh;
 
 #if ENABLE_PLATFORM_MINGW32
 	INIT_G_memstack();
-
-	/* from init() */
-	basepf.next_to_pgetc = basepf.buf = ckzalloc(IBUFSIZ);
-	basepf.linno = 1;
 
 	if (argc == 3 && !strcmp(argv[1], "--fs")) {
 		forkshell_init(argv[2]);
@@ -16353,7 +16542,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 #endif
 
 	state = 0;
-	if (setjmp(jmploc.loc)) {
+	if (setjmp(main_handler.loc)) {
 		smallint e;
 		smallint s;
 
@@ -16372,7 +16561,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 		}
 
 		popstackmark(&smark);
-		FORCE_INT_ON; /* enable interrupts */
+		FORCEINTON; /* enable interrupts */
 		if (s == 1)
 			goto state1;
 		if (s == 2)
@@ -16381,7 +16570,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 			goto state3;
 		goto state4;
 	}
-	exception_handler = &jmploc;
+	exception_handler = &main_handler;
 	rootpid = getpid();
 
 	init();
@@ -16499,11 +16688,11 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 			if (!hp) {
 				hp = lookupvar("HOME");
 				if (hp) {
-					INT_OFF;
+					INTOFF;
 					hp = concat_path_file(hp, ".ash_history");
 					setvar0("HISTFILE", hp);
 					free((char*)hp);
-					INT_ON;
+					INTON;
 					hp = lookupvar("HISTFILE");
 				}
 			}
@@ -16578,7 +16767,7 @@ forkshell_evalbackcmd(struct forkshell *fs)
 	pip[ip] = fs->fd[ip];
 	pip[ic] = fs->fd[ic];
 
-	FORCE_INT_ON;
+	FORCEINTON;
 	close(pip[ip]);
 	if (pip[ic] != ic) {
 		/*close(ic);*/
@@ -16598,7 +16787,7 @@ forkshell_evalsubshell(struct forkshell *fs)
 	int flags = fs->flags;
 
 	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
-	INT_ON;
+	INTON;
 	flags |= EV_EXIT;
 	if (fs->mode)
 		flags &= ~EV_TESTED;
@@ -16617,7 +16806,7 @@ forkshell_evalpipe(struct forkshell *fs)
 	int pip[2] = {fs->fd[0], fs->fd[1]};
 
 	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
-	INT_ON;
+	INTON;
 	if (pip[1] >= 0) {
 		close(pip[0]);
 	}
@@ -16637,9 +16826,9 @@ forkshell_shellexec(struct forkshell *fs)
 {
 	int idx = fs->fd[0];
 	char **argv = fs->argv;
-	char *path = fs->path;
+	const char *path = fs->path;
 
-	FORCE_INT_ON;
+	FORCEINTON;
 	shellexec(argv[0], argv, path, idx, TRUE);
 }
 
@@ -17189,6 +17378,8 @@ globals_misc_size(struct datasize ds)
 #undef physdir
 #undef arg0
 #undef commandname
+#undef g_parsefile
+#undef basepf
 #undef nullstr
 #undef trap
 static struct globals_misc *
@@ -17217,6 +17408,8 @@ globals_misc_copy(void)
 		new->trap[i] = nodeckstrdup(p->trap[i]);
 		SAVE_PTR(new->trap[i], xasprintf("trap[%d]", i), FREE);
 	}
+	new->g_parsefile = NULL;
+	memset(&new->basepf, 0, sizeof(struct parsefile));
 	return new;
 }
 
@@ -17229,8 +17422,8 @@ forkshell_size(struct forkshell *fs)
 	if (fs->fpid == FS_OPENHERE)
 		return ds;
 
-	ds = globals_var_size(ds);
 	ds = globals_misc_size(ds);
+	ds = globals_var_size(ds);
 	ds = cmdtable_size(ds);
 
 	ds.funcblocksize = calcsize(ds.funcblocksize, fs->n);
@@ -17262,11 +17455,11 @@ forkshell_copy(struct forkshell *fs, struct forkshell *new)
 	if (fs->fpid == FS_OPENHERE)
 		return;
 
-	new->gvp = globals_var_copy();
 	new->gmp = globals_misc_copy();
+	new->gvp = globals_var_copy();
 	new->cmdtable = cmdtable_copy();
-	SAVE_PTR(new->gvp, "gvp", NO_FREE);
 	SAVE_PTR(new->gmp, "gmp", NO_FREE);
+	SAVE_PTR(new->gvp, "gvp", NO_FREE);
 	SAVE_PTR(new->cmdtable, "cmdtable", NO_FREE);
 
 	new->n = copynode(fs->n);
@@ -17303,7 +17496,7 @@ forkshell_copy(struct forkshell *fs, struct forkshell *new)
 
 #if FORKSHELL_DEBUG
 #define NUM_BLOCKS FUNCSTRING
-enum {GVP, GMP, CMDTABLE, NODE, ARGV, ATAB, HISTORY, JOBTAB, FUNCSTRING};
+enum {GMP, GVP, CMDTABLE, NODE, ARGV, ATAB, HISTORY, JOBTAB, FUNCSTRING};
 
 /* fp0 and notes can each be NULL */
 static void
@@ -17368,8 +17561,8 @@ forkshell_print(FILE *fp0, struct forkshell *fs, const char **notes)
 		lptr[ARGV] = fs->argv ? (char *)fs->argv : lptr[ATAB];
 		lptr[NODE] = fs->n ? (char *)fs->n : lptr[ARGV];
 		lptr[CMDTABLE] = (char *)fs->cmdtable;
-		lptr[GMP] = (char *)fs->gmp;
 		lptr[GVP] = (char *)fs->gvp;
+		lptr[GMP] = (char *)fs->gmp;
 
 		fprintf(fp, "funcblocksize %6d = ", fs->funcblocksize);
 		total = 0;
@@ -17511,7 +17704,6 @@ forkshell_init(const char *idstr)
 	int i;
 	char **ptr;
 	char *lrelocate;
-	struct jmploc jmploc;
 
 	if (sscanf(idstr, "%p", &map_handle) != 1)
 		return;
@@ -17549,9 +17741,14 @@ forkshell_init(const char *idstr)
 	}
 	fs->gmp->trap_ptr = fs->gmp->trap;
 
+	/* from init() */
+	fs->gmp->basepf.next_to_pgetc = fs->gmp->basepf.buf = ckzalloc(IBUFSIZ);
+	fs->gmp->basepf.linno = 1;
+	fs->gmp->g_parsefile = &fs->gmp->basepf;
+
 	/* Set global variables */
-	ASSIGN_CONST_PTR(&ash_ptr_to_globals_var, fs->gvp);
 	ASSIGN_CONST_PTR(&ash_ptr_to_globals_misc, fs->gmp);
+	ASSIGN_CONST_PTR(&ash_ptr_to_globals_var, fs->gvp);
 	cmdtable = fs->cmdtable;
 #if ENABLE_ASH_ALIAS
 	atab = fs->atab;	/* will be NULL for FS_SHELLEXEC */
@@ -17574,11 +17771,11 @@ forkshell_init(const char *idstr)
 
 	reinitvar();
 
-	if (setjmp(jmploc.loc)) {
+	if (setjmp(main_handler.loc)) {
 		exitreset();
 		exitshell();
 	}
-	exception_handler = &jmploc;
+	exception_handler = &main_handler;
 
 	shlvl++;
 	if (fs->mode == FORK_BG) {
@@ -17607,7 +17804,7 @@ forkshell_init(const char *idstr)
 	clear_traps();
 #if JOBS_WIN32
 	/* do job control only in root shell */
-	doing_jobctl = 0;
+	jobctl = 0;
 
 	if (fs->n && fs->n->type == NCMD && fs->n->ncmd.args &&
 			strcmp(fs->n->ncmd.args->narg.text, "jobs") == 0) {
